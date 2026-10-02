@@ -680,6 +680,10 @@ def trtllm_create_ipc_workspace_for_all_reduce_fusion(
             f"warning: lamport_comm_size {lamport_comm_size} is greater than MAX_COMM_SIZE {MAX_COMM_SIZE}, set to MAX_COMM_SIZE"
         )
         lamport_comm_size = MAX_COMM_SIZE
+    # lamport_comm_size is also the stride between the three Lamport slots; the kernels
+    # read and write the slots with 16-byte vectors, so an odd hidden_dim (e.g. 9) would
+    # put slots 1 and 2 at misaligned addresses. Round the stride up.
+    lamport_comm_size = round_up(lamport_comm_size, 16)
 
     lamport_buffer_size = lamport_comm_size * 3
 
@@ -1374,6 +1378,11 @@ def trtllm_allgather(
     if need > MAX_COMM_SIZE:
         raise ValueError(f"trtllm_allgather: {need} B exceeds MAX_COMM_SIZE {MAX_COMM_SIZE} B")
     if metadata is not None:
+        if metadata["lamport_comm_size"] % 16 != 0:
+            raise ValueError(
+                f"trtllm_allgather: workspace slot stride (lamport_comm_size {metadata['lamport_comm_size']} B) is not "
+                "16-byte aligned; slots 1 and 2 would be misaligned for the kernel's vector accesses"
+            )
         if need > metadata["lamport_comm_size"]:
             raise ValueError(f"trtllm_allgather: {need} B exceeds the workspace lamport_comm_size {metadata['lamport_comm_size']} B")
         if metadata["tp_size"] != world_size:
