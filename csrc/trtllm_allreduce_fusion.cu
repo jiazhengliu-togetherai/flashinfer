@@ -93,3 +93,25 @@ void trtllm_allreduce_fusion(TensorView allreduce_in, int64_t world_size, int64_
 }
 
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(trtllm_allreduce_fusion, trtllm_allreduce_fusion);
+
+void trtllm_allgather(TensorView input, TensorView output, int64_t size, int64_t world_size,
+                      int64_t world_rank, TensorView workspace_ptrs, bool launch_with_pdl,
+                      bool trigger_completion_at_end) {
+  ffi::CUDADeviceGuard device_guard(input.device().device_id);
+  DISPATCH_FLOATING_TYPES_FOR_ALLREDUCE(input.dtype(), c_type, [&] {
+    AllGatherParams<c_type> params;
+    params.nranks = world_size;
+    params.rank = world_rank;
+    params.size = size;
+    params.workspace = reinterpret_cast<void**>(workspace_ptrs.data_ptr());
+    params.input = reinterpret_cast<void*>(input.data_ptr());
+    params.output = reinterpret_cast<void*>(output.data_ptr());
+    params.trigger_completion_at_end = trigger_completion_at_end;
+    params.stream = get_stream(input.device());
+    auto status = allgather_op(params, launch_with_pdl);
+    TVM_FFI_ICHECK(status == cudaSuccess)
+        << "allgather_op failed with error code" << cudaGetErrorString(status);
+  });
+}
+
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(trtllm_allgather, trtllm_allgather);

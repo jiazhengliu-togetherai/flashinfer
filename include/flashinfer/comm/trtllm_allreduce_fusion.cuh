@@ -1930,6 +1930,168 @@ cudaError_t allreduce_fusion_op(AllReduceFusionParams<T> const& params, bool lau
   }
 }
 
+
+// ---- all-gather on the Lamport one-shot protocol (warm-clone E2) ----------------------------------
+// Same push/clear/poll protocol as allreduce_fusion_kernel_oneshot_lamport, but the gathered slices are
+// stored to output[r * size + idx] instead of being summed. Flat indexing: no per-token constraints.
+template <typename T>
+struct AllGatherParams {
+  int nranks;
+  int rank;
+  int size;  // elements per rank
+  void** workspace;
+  void* input;
+  void* output;  // [nranks, size]
+  cudaStream_t stream;
+  bool trigger_completion_at_end = true;
+};
+
+template <typename T, int NRanks, bool TriggerCompletionAtEnd>
+__global__ void allgather_kernel_oneshot_lamport(AllGatherParams<T> params) {
+  static constexpr int VEC_SIZE = details::kBytesPerAccess / sizeof(T);
+  static constexpr int UNROLL = NRanks <= 2 ? 4 : (NRanks <= 4 ? 2 : 1);  // vectors in flight per thread; vals[UNROLL][NRanks] must fit the register budget
+  int tot_access = params.size / VEC_SIZE;
+  int access_id = blockIdx.x * blockDim.x + threadIdx.x;
+  int access_stride = gridDim.x * blockDim.x;
+  vec_t<T, VEC_SIZE> clear_vec;
+  clear_vec.fill(neg_zero_v<T>);
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+  cudaGridDependencySynchronize();
+  if constexpr (!TriggerCompletionAtEnd) {
+    cudaTriggerProgrammaticLaunchCompletion();
+  }
+#endif
+  LamportComm<NRanks> comm(params.workspace, params.rank);
+  int clear_access = comm.clear_size / VEC_SIZE;
+  T* in = reinterpret_cast<T*>(params.input);
+  T* out = reinterpret_cast<T*>(params.output);
+  T* mine = reinterpret_cast<T*>(comm.data_bufs[params.rank]);
+  // push: my slice -> every rank's buffer at [rank * tot_access + idx]
+  for (int base = access_id; base < tot_access; base += UNROLL * access_stride) {
+    vec_t<T, VEC_SIZE> v[UNROLL];
+#pragma unroll
+    for (int u = 0; u < UNROLL; ++u) {
+      int idx = base + u * access_stride;
+      if (idx < tot_access) {
+        v[u].load(in + idx * VEC_SIZE);
+        remove_neg_zero<T, VEC_SIZE>(v[u]);
+      }
+    }
+#pragma unroll
+    for (int u = 0; u < UNROLL; ++u) {
+      int idx = base + u * access_stride;
+      if (idx < tot_access) {
+#pragma unroll
+        for (int r = 0; r < NRanks; ++r) {
+          v[u].store(reinterpret_cast<T*>(comm.data_bufs[r]) + (params.rank * tot_access + idx) * VEC_SIZE);
+        }
+      }
+    }
+  }
+  // clear the slot the previous call used
+  for (int idx = access_id; idx < clear_access; idx += access_stride) {
+    clear_vec.store(reinterpret_cast<T*>(comm.clear_buf) + idx * VEC_SIZE);
+  }
+  // poll my buffer for every rank's slice, then write the gathered layout to output
+  for (int base = access_id; base < tot_access; base += UNROLL * access_stride) {
+    vec_t<T, VEC_SIZE> vals[UNROLL][NRanks];
+    bool done = false;
+    while (!done) {
+      done = true;
+#pragma unroll
+      for (int u = 0; u < UNROLL; ++u) {
+        int idx = base + u * access_stride;
+        if (idx < tot_access) {
+#pragma unroll
+          for (int r = 0; r < NRanks; ++r) {
+            vals[u][r].load_global_volatile(mine + (r * tot_access + idx) * VEC_SIZE);
+            done &= !has_neg_zero<T, VEC_SIZE>(vals[u][r]);
+          }
+        }
+      }
+    }
+#pragma unroll
+    for (int u = 0; u < UNROLL; ++u) {
+      int idx = base + u * access_stride;
+      if (idx < tot_access) {
+#pragma unroll
+        for (int r = 0; r < NRanks; ++r) {
+          vals[u][r].store(out + (r * tot_access + idx) * VEC_SIZE);
+        }
+      }
+    }
+  }
+  comm.update(params.size * NRanks);
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+  if constexpr (TriggerCompletionAtEnd) {
+    cudaTriggerProgrammaticLaunchCompletion();
+  }
+#endif
+}
+
+template <typename T, int NRanks>
+cudaError_t allgather_oneshot_launcher(AllGatherParams<T> const& params, bool launch_with_pdl) {
+  static constexpr int VEC_SIZE = details::kBytesPerAccess / sizeof(T);
+  FLASHINFER_CHECK(params.size % VEC_SIZE == 0, "allgather: size % VEC_SIZE != 0");
+  static int SM = utils::getSMVersion();
+  int tot_access = params.size / VEC_SIZE;
+  // Every block polls for the slice its peer block pushes, so all blocks of all ranks must be co-resident:
+  // grid <= SM count * max resident blocks per SM (same assumption as the one-shot allreduce, which uses 1 per SM).
+  // Block size from the kernel's register footprint (vals[UNROLL][NRanks] grows with NRanks), as the AR launcher does.
+  auto kernel_t = allgather_kernel_oneshot_lamport<T, NRanks, true>;
+  auto kernel_f = allgather_kernel_oneshot_lamport<T, NRanks, false>;
+  static int block_size = -1;
+  static int blocks_per_sm = -1;
+  if (block_size < 0) {
+    cudaFuncAttributes attr;
+    FLASHINFER_CUDA_CALL(cudaFuncGetAttributes(&attr, kernel_t));
+    static int max_registers = utils::getSMRegisters();
+    int regs = attr.numRegs > 0 ? attr.numRegs : 64;
+    int bs = std::min(1024, max_registers / regs);
+    bs = std::min(bs, attr.maxThreadsPerBlock);
+    bs = (bs / 128) * 128;
+    block_size = bs < 128 ? 128 : bs;
+    int nb = 1;
+    cudaOccupancyMaxActiveBlocksPerMultiprocessor(&nb, kernel_t, block_size, 0);
+    blocks_per_sm = nb < 1 ? 1 : nb;
+  }
+  int needed = (tot_access + block_size - 1) / block_size;
+  int grid_size = std::max(1, std::min(get_sm_count() * blocks_per_sm, needed));
+  cudaLaunchConfig_t cfg;
+  cudaLaunchAttribute attribute[1];
+  cfg.gridDim = grid_size;
+  cfg.blockDim = block_size;
+  cfg.dynamicSmemBytes = 0;
+  cfg.stream = params.stream;
+  attribute[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+  attribute[0].val.programmaticStreamSerializationAllowed = launch_with_pdl ? 1 : 0;
+  cfg.attrs = attribute;
+  cfg.numAttrs = SM >= 90 ? 1 : 0;
+  if (params.trigger_completion_at_end) {
+    FLASHINFER_CUDA_CALL(cudaLaunchKernelEx(&cfg, kernel_t, params));
+  } else {
+    FLASHINFER_CUDA_CALL(cudaLaunchKernelEx(&cfg, kernel_f, params));
+  }
+  return cudaSuccess;
+}
+
+template <typename T>
+cudaError_t allgather_op(AllGatherParams<T> const& params, bool launch_with_pdl) {
+  switch (params.nranks) {
+    case 2:
+      return allgather_oneshot_launcher<T, 2>(params, launch_with_pdl);
+    case 4:
+      return allgather_oneshot_launcher<T, 4>(params, launch_with_pdl);
+    case 8:
+      return allgather_oneshot_launcher<T, 8>(params, launch_with_pdl);
+    case 16:
+      return allgather_oneshot_launcher<T, 16>(params, launch_with_pdl);
+    default:
+      FLASHINFER_ERROR("allgather: unsupported ranks number! Supported ranks: 2, 4, 8, 16.");
+  }
+  return cudaSuccess;
+}
+
 }  // namespace trtllm_allreduce_fusion
 
 }  // namespace flashinfer

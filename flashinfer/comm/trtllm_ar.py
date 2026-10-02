@@ -415,7 +415,23 @@ def get_trtllm_comm_module():
             weight_bias,
         )
 
+    @register_custom_op("flashinfer::trtllm_allgather", mutates_args=["output"])
+    def trtllm_allgather(
+        input: torch.Tensor,
+        output: torch.Tensor,
+        size: int,
+        world_size: int,
+        world_rank: int,
+        workspace_ptrs: torch.Tensor,
+        launch_with_pdl: bool,
+        trigger_completion_at_end: bool,
+    ) -> None:
+        module.trtllm_allgather(
+            input, output, size, world_size, world_rank, workspace_ptrs, launch_with_pdl, trigger_completion_at_end
+        )
+
     return SimpleNamespace(
+        trtllm_allgather=trtllm_allgather,
         trtllm_lamport_initialize=trtllm_lamport_initialize,
         trtllm_lamport_initialize_all=trtllm_lamport_initialize_all,
         trtllm_custom_all_reduce=trtllm_custom_all_reduce,
@@ -1317,4 +1333,37 @@ def trtllm_moe_finalize_allreduce_fusion(
         expert_scale_factor=expert_scale_factor,
         routed_scaling_factor=routed_scaling_factor,
         weight_bias=weight_bias,
+    )
+
+
+def trtllm_allgather(
+    input: torch.Tensor,
+    output: torch.Tensor,
+    world_size: int,
+    world_rank: int,
+    workspace_ptrs: torch.Tensor,
+    launch_with_pdl: bool = False,
+    trigger_completion_at_end: bool = True,
+    metadata: Optional[dict] = None,
+) -> None:
+    """All-gather on the Lamport one-shot protocol of an allreduce-fusion workspace (warm-clone E2).
+
+    output must be contiguous with shape (world_size, *input.shape); output[r] receives rank r's input. The kernel
+    reads peer pointers and flags from the workspace pointer table at run time, so a CUDA graph that records this
+    call stays valid when the workspace is re-created at the same address with new peer pointers. Capacity:
+    input.numel() * world_size * itemsize must fit lamport_comm_size (checked when metadata is given).
+    """
+    assert input.is_contiguous() and output.is_contiguous(), "trtllm_allgather needs contiguous tensors"
+    n = input.numel()
+    assert output.numel() == n * world_size and output.dtype == input.dtype, "output must be [world_size, *input.shape]"
+    if metadata is not None:
+        need = n * world_size * input.element_size()
+        if need > metadata["lamport_comm_size"]:
+            raise ValueError(f"trtllm_allgather: {need} B exceeds the workspace lamport_comm_size {metadata['lamport_comm_size']} B")
+        if metadata["tp_size"] != world_size:
+            raise ValueError(f"trtllm_allgather: world_size {world_size} != workspace tp_size {metadata['tp_size']}")
+        if metadata["use_fp32_lamport"] != (input.dtype == torch.float32):
+            raise ValueError("trtllm_allgather: dtype does not match the workspace's use_fp32_lamport")
+    get_trtllm_comm_module().trtllm_allgather(
+        input, output, n, world_size, world_rank, workspace_ptrs, launch_with_pdl, trigger_completion_at_end
     )
