@@ -1,151 +1,547 @@
+"""Correctness tests for flashinfer.comm.trtllm_allgather (all-gather on the Lamport one-shot allreduce workspace).
+
+What is covered, and why:
+  1. workspace replacement without graph re-capture: the feature's main claim. A graph recorded against workspace A
+     must replay correctly after A's pointer table is rewritten in place with new peer buffers and control flags;
+  2. graph lengths that are not a multiple of the 3-slot Lamport rotation (1, 2, 4, 5 calls), captured after 0/1/2
+     eager calls and interleaved with eager calls between replays;
+  3. back-to-back calls with no intermediate synchronization, irregular size sequences, per-rank skew, and
+     alternation with the one-shot allreduce on the same workspace (both advance the slot rotation the same way);
+  4. boundary sizes (empty, one vector, around block/grid multiples, exact capacity, one vector beyond) and
+     alignment (16-byte aligned slices accepted, odd storage offsets and non-vector sizes rejected before launch);
+  5. bit-exact value checks (integer views) on inputs that encode rank, position and call number plus +0/-0/inf/nan/
+     subnormal/extreme values; the documented -0.0 -> +0.0 normalization is checked explicitly;
+  6. execution variants: fp32 workspace, launch_with_pdl, trigger_completion_at_end, metadata mismatch rejection,
+     calls without metadata; world_size 2/4/8/16 (skipped when the host has fewer GPUs);
+  7. a bounded harness: shared deadline, prompt failure detection, remaining workers killed; two self-tests prove it
+     reports a failing and a stalled worker instead of hanging.
+
+Run as: pytest tests/comm/test_trtllm_allgather.py -rA   (needs >= 2 GPUs; CUDA_VISIBLE_DEVICES picks them)
+"""
+
 import multiprocessing as mp
-import socket
-from typing import Any
+import os
+import sys
+import time
+import traceback
+from typing import Callable, Sequence
 
 import pytest
 import torch
 import torch.distributed as dist
 
 import flashinfer.comm as comm
+from flashinfer.comm.trtllm_ar import AllReduceFusionPattern
 from flashinfer.utils import get_compute_capability
 
 pytestmark = pytest.mark.skipif(
-    not torch.cuda.is_available()
-    or get_compute_capability(torch.device("cuda:0"))[0] not in (9, 10, 12),
+    not torch.cuda.is_available() or get_compute_capability(torch.device("cuda:0"))[0] not in (9, 10, 12),
     reason="trtllm_comm kernels support SM90/SM100/SM12x only",
 )
 
-# Largest shape: 256 tokens x a 38,720-wide vocab shard (GLM-5.3-Flash lm_head at TP=4) -> 19 MiB per rank.
+# Workspace sized for 256 tokens x a 38,720-wide vocab shard (GLM-5.3-Flash lm_head at TP=4): 19 MiB per rank.
 MAX_TOKEN_NUM = 256
 HIDDEN_DIM = 38720
-SHAPES = [(256, 38720), (7, 38720), (1, 4096), (64, 38720)]
+VEC = {torch.float16: 8, torch.bfloat16: 8, torch.float32: 4}  # elements per 16-byte vector
+INT_VIEW = {torch.float16: torch.int16, torch.bfloat16: torch.int16, torch.float32: torch.int32}
+WORLD_SIZES = [2, 4, 8, 16]
+GPUS = torch.cuda.device_count() if torch.cuda.is_available() else 0
 
 
-def _make_input(rank: int, call: int, shape, dtype, device) -> torch.Tensor:
-    """Deterministic per-(rank, call) input so every rank can build the expected gather locally."""
-    g = torch.Generator(device="cpu").manual_seed(1000 * call + rank)
-    x = torch.randn(shape, generator=g, dtype=torch.float32) * 3.0
-    x.view(-1)[:16] = -0.0  # the Lamport sentinel value must come out as +0.0
-    return x.to(dtype).to(device)
+# ----------------------------------------------------------------------------------------------------------------
+# data: every rank can compute every other rank's input locally from (rank, call); values encode rank, position and
+# call so a swapped rank, a stale slot or a shifted element is visible; bit-exact comparison through integer views
+# ----------------------------------------------------------------------------------------------------------------
+_SPECIAL = [0.0, -0.0, float("inf"), float("-inf"), float("nan"), 65504.0, -65504.0, 6.1035e-5, 5.9605e-8, 1.0,
+            -1.0, 0.5, 3.140625, -2.71875, 1e-3, -1e-3]  # fp16 max, min normal, smallest subnormal, odd values
 
 
-def _expected(world_size: int, call: int, shape, dtype, device) -> torch.Tensor:
-    return torch.stack([_make_input(r, call, shape, dtype, device) for r in range(world_size)])
+def make_input(rank: int, call: int, shape: Sequence[int], dtype: torch.dtype, device) -> torch.Tensor:
+    """Generated on the GPU: CPU-side generation with the default OMP thread count made every call take seconds when
+    several ranks share one host (224 cores x 4 processes of spinning OpenMP threads)."""
+    numel = 1
+    for d in shape:
+        numel *= d
+    i = torch.arange(numel, dtype=torch.float32, device=device)
+    structured = (i % 997) * 0.25 + rank * 1000.0 + (call % 50) * 0.125
+    g = torch.Generator(device=device).manual_seed(100003 * call + 7919 * rank + numel)
+    noise = torch.randn(numel, generator=g, device=device) * 3.0
+    x = torch.where(i % 2 == 0, structured, noise).to(dtype)
+    if numel >= 64:
+        sp = torch.tensor(_SPECIAL, dtype=torch.float32, device=device).to(dtype)
+        x[:16] = sp
+        x[16:32] = -sp  # flips the sign bit of every special value, including NaN's
+        x[32:48] = torch.full((16,), -0.0, dtype=dtype, device=device)  # a full sentinel vector
+    return x.view(*shape)
 
 
-def _run_allgather_worker(world_size, rank, dtype, hidden_dim, distributed_init_port, gpu_offset=0):
-    device = torch.device(f"cuda:{rank + gpu_offset}")
-    torch.cuda.set_device(device)
-    dist.init_process_group(
-        backend="nccl",
-        init_method=f"tcp://localhost:{distributed_init_port}",
-        rank=rank,
-        world_size=world_size,
+def expected_gather(world_size: int, call: int, shape, dtype, device) -> torch.Tensor:
+    return torch.stack([make_input(r, call, shape, dtype, device) for r in range(world_size)])
+
+
+def normalize_ref(ref: torch.Tensor) -> torch.Tensor:
+    """The kernel uses -0.0 as the Lamport sentinel and emits +0.0 for it; everything else is passed bit-for-bit."""
+    ref = ref.clone()
+    ref[ref == 0] = 0.0  # -0.0 == 0 -> written as +0.0
+    return ref
+
+
+def check_bits(out: torch.Tensor, ref: torch.Tensor, what: str) -> None:
+    o = out.view(INT_VIEW[out.dtype])
+    r = normalize_ref(ref).view(INT_VIEW[ref.dtype])
+    if torch.equal(o, r):  # integer views: NaN payloads and the sign of zero are compared bit for bit
+        return
+    bad = o != r
+    idx = bad.flatten().nonzero().flatten()[:6].tolist()
+    raise AssertionError(
+        f"{what}: {int(bad.sum())}/{o.numel()} elements differ, first flat indices {idx}; "
+        f"got {out.flatten()[idx].tolist()} want {ref.flatten()[idx].tolist()}"
     )
-    group = dist.group.WORLD
+
+
+# ----------------------------------------------------------------------------------------------------------------
+# bounded multi-process harness
+# ----------------------------------------------------------------------------------------------------------------
+class HarnessFailure(RuntimeError):
+    pass
+
+
+def _worker_main(fn: Callable, world_size: int, rank: int, dtype: torch.dtype, port: int, kwargs: dict) -> None:
     try:
-        ipc_handles, workspace, metadata = comm.trtllm_create_ipc_workspace_for_all_reduce_fusion(
-            rank,
-            world_size,
-            MAX_TOKEN_NUM,
-            hidden_dim,
-            use_fp32_lamport=(dtype == torch.float32),
-            group=group,
-            create_metadata=True,
+        torch.set_num_threads(4)  # several ranks share the host; default = all cores -> OpenMP spin contention
+        torch.cuda.set_device(rank)
+        # the parent owns the rendezvous socket (TCPStore master), so no port can be stolen between spawn and init
+        store = dist.TCPStore("127.0.0.1", port, world_size, is_master=False, timeout=__import__("datetime").timedelta(seconds=120))
+        dist.init_process_group("nccl", store=store, rank=rank, world_size=world_size)
+        fn(world_size, rank, dtype, **kwargs)
+        torch.cuda.synchronize()
+        dist.barrier()
+        dist.destroy_process_group()
+        sys.stdout.flush()
+        os._exit(0)
+    except BaseException:  # noqa: BLE001 - report anything, then exit non-zero without touching the collective
+        traceback.print_exc()
+        sys.stderr.flush()
+        sys.stdout.flush()
+        os._exit(1)
+
+
+def run_workers(fn: Callable, world_size: int, dtype: torch.dtype, timeout_s: float = 600.0, **kwargs) -> None:
+    """Spawn one process per rank; fail promptly on any non-zero exit; kill the rest on failure or deadline."""
+    ctx = mp.get_context("spawn")
+    master = dist.TCPStore("127.0.0.1", 0, world_size, is_master=True, wait_for_workers=False)  # held until the end
+    port = master.port
+    procs = [
+        ctx.Process(target=_worker_main, args=(fn, world_size, r, dtype, port, kwargs), name=f"rank{r}")
+        for r in range(world_size)
+    ]
+    for p in procs:
+        p.start()
+    deadline = time.monotonic() + timeout_s
+    failure = None
+    while True:
+        bad = [p for p in procs if not p.is_alive() and p.exitcode not in (0, None)]
+        if bad:
+            failure = f"{bad[0].name} exited with code {bad[0].exitcode}"
+            break
+        if not any(p.is_alive() for p in procs):
+            break
+        if time.monotonic() > deadline:
+            failure = f"timeout after {timeout_s:.0f}s; still running: {[p.name for p in procs if p.is_alive()]}"
+            break
+        time.sleep(0.1)
+    for p in procs:
+        if p.is_alive():
+            p.kill()
+    for p in procs:
+        p.join(10)
+    del master
+    if failure:
+        raise HarnessFailure(f"{fn.__name__} (world_size={world_size}, {dtype}): {failure}")
+
+
+def _need_gpus(world_size: int) -> None:
+    if world_size > GPUS:
+        pytest.skip(f"world_size {world_size} needs {world_size} GPUs, host exposes {GPUS}")
+
+
+# ----------------------------------------------------------------------------------------------------------------
+# worker-side helpers
+# ----------------------------------------------------------------------------------------------------------------
+def create_workspace(rank: int, world_size: int, dtype: torch.dtype, max_token_num: int = MAX_TOKEN_NUM,
+                     hidden_dim: int = HIDDEN_DIM):
+    return comm.trtllm_create_ipc_workspace_for_all_reduce_fusion(
+        rank, world_size, max_token_num, hidden_dim, use_fp32_lamport=(dtype == torch.float32),
+        group=dist.group.WORLD, create_metadata=True,
+    )
+
+
+def capacity_elems(metadata: dict, world_size: int, dtype: torch.dtype) -> int:
+    return metadata["lamport_comm_size"] // (world_size * torch.tensor([], dtype=dtype).element_size())
+
+
+VERBOSE = os.environ.get("AG_VERBOSE", "0") == "1"
+
+
+def log(rank: int, msg: str) -> None:
+    if VERBOSE:
+        print(f"[rank {rank} {time.strftime('%H:%M:%S')}] {msg}", flush=True)
+
+
+class Calls:
+    """Monotonic call counter so every collective in a worker has a unique data pattern (identical on all ranks)."""
+
+    def __init__(self) -> None:
+        self.n = 0
+
+    def next(self) -> int:
+        self.n += 1
+        return self.n
+
+
+def gather_checked(rank, world_size, ws, meta, dtype, device, shape, calls: Calls, sync=True, **kw):
+    call = calls.next()
+    log(rank, f"eager call {call} shape {tuple(shape)} {kw}")
+    x = make_input(rank, call, shape, dtype, device)
+    out = torch.empty((world_size,) + tuple(shape), dtype=dtype, device=device)
+    torch.cuda.synchronize()
+    t0 = time.perf_counter()
+    comm.trtllm_allgather(x, out, world_size, rank, ws, metadata=meta, **kw)
+    if sync:
+        torch.cuda.synchronize()
+        t1 = time.perf_counter()
+        check_bits(out, expected_gather(world_size, call, shape, dtype, device), f"eager call {call} shape {tuple(shape)}")
+        log(rank, f"  collective {1e3*(t1-t0):.2f} ms, check {1e3*(time.perf_counter()-t1):.1f} ms")
+    return call, out
+
+
+# ----------------------------------------------------------------------------------------------------------------
+# scenario 5 + 6 (partly): eager, bit-exact, several shapes, three passes over the slot rotation, with/without metadata
+# ----------------------------------------------------------------------------------------------------------------
+def s_eager(world_size, rank, dtype):
+    device = torch.device("cuda", rank)
+    handles, ws, meta = create_workspace(rank, world_size, dtype)
+    calls = Calls()
+    shapes = [(256, HIDDEN_DIM), (7, HIDDEN_DIM), (1, 4096), (64, HIDDEN_DIM), (3, 5, 8), (8, 3)]
+    if dtype == torch.float32:
+        shapes = [(128, HIDDEN_DIM), (7, HIDDEN_DIM), (1, 4096), (3, 5, 8)]
+    for _pass in range(3):
+        for shape in shapes:
+            gather_checked(rank, world_size, ws, meta, dtype, device, shape, calls)
+    for shape in shapes[:2]:  # the wrapper's own checks still apply when no metadata is passed
+        gather_checked(rank, world_size, ws, None, dtype, device, shape, calls)
+    dist.barrier()
+    comm.trtllm_destroy_ipc_workspace_for_all_reduce_fusion(handles)
+
+
+# ----------------------------------------------------------------------------------------------------------------
+# scenario 2: graph lengths 1/2/4/5 captured after 0/1/2 eager calls, replays interleaved with eager calls
+# ----------------------------------------------------------------------------------------------------------------
+GRAPH_SHAPES = [(64, HIDDEN_DIM), (3, 4096), (16, HIDDEN_DIM), (1, 4096), (5, HIDDEN_DIM)]
+
+
+def _capture(rank, world_size, ws, meta, dtype, device, shapes, calls: Calls, **kw):
+    """Record one trtllm_allgather per shape into a CUDA graph; returns (graph, xs, outs). Warm-up on the side
+    stream first (executes the ops once; the data of that pass is also checked)."""
+    xs = [torch.empty(s, dtype=dtype, device=device) for s in shapes]
+    outs = [torch.empty((world_size,) + tuple(s), dtype=dtype, device=device) for s in shapes]
+    stream = torch.cuda.Stream()
+    warm = [calls.next() for _ in shapes]
+    log(rank, f"capture: warm-up calls {warm} shapes {shapes} {kw}")
+    with torch.cuda.stream(stream):
+        for i, s in enumerate(shapes):
+            xs[i].copy_(make_input(rank, warm[i], s, dtype, device))
+            comm.trtllm_allgather(xs[i], outs[i], world_size, rank, ws, metadata=meta, **kw)
+    torch.cuda.synchronize()
+    for i, s in enumerate(shapes):
+        check_bits(outs[i], expected_gather(world_size, warm[i], s, dtype, device), f"warm-up {i} shape {s}")
+    dist.barrier()
+    log(rank, "capture: recording")
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=stream):
+        for i, s in enumerate(shapes):
+            comm.trtllm_allgather(xs[i], outs[i], world_size, rank, ws, metadata=meta, **kw)
+    torch.cuda.synchronize()
+    dist.barrier()
+    log(rank, "capture: done")
+    return graph, xs, outs
+
+
+def _replay_checked(rank, world_size, graph, xs, outs, shapes, dtype, device, calls: Calls, label: str):
+    ids = [calls.next() for _ in shapes]
+    log(rank, f"{label}: replay calls {ids}")
+    for i, s in enumerate(shapes):
+        xs[i].copy_(make_input(rank, ids[i], s, dtype, device))
+    graph.replay()
+    torch.cuda.synchronize()
+    for i, s in enumerate(shapes):
+        check_bits(outs[i], expected_gather(world_size, ids[i], s, dtype, device), f"{label} replay call {i} shape {s}")
+
+
+def s_graph_phases(world_size, rank, dtype):
+    device = torch.device("cuda", rank)
+    handles, ws, meta = create_workspace(rank, world_size, dtype)
+    calls = Calls()
+    for offset in (0, 1, 2):
+        for _ in range(offset):  # shift the slot phase before capturing
+            gather_checked(rank, world_size, ws, meta, dtype, device, (2, 4096), calls)
+        for ncalls in (1, 2, 4, 5):
+            shapes = GRAPH_SHAPES[:ncalls]
+            graph, xs, outs = _capture(rank, world_size, ws, meta, dtype, device, shapes, calls)
+            for rep in range(3):
+                _replay_checked(rank, world_size, graph, xs, outs, shapes, dtype, device, calls,
+                                f"offset {offset} ncalls {ncalls} rep {rep}")
+                gather_checked(rank, world_size, ws, meta, dtype, device, (9, 4096), calls)  # eager between replays
+            graph.replay()  # two replays back to back, checked after the second
+            _replay_checked(rank, world_size, graph, xs, outs, shapes, dtype, device, calls,
+                            f"offset {offset} ncalls {ncalls} double")
+            del graph
+    dist.barrier()
+    comm.trtllm_destroy_ipc_workspace_for_all_reduce_fusion(handles)
+
+
+# ----------------------------------------------------------------------------------------------------------------
+# scenario 1: replace the workspace's peer buffers and control flags in place; replay the original graph
+# ----------------------------------------------------------------------------------------------------------------
+def s_workspace_replacement(world_size, rank, dtype, rounds: int = 3):
+    device = torch.device("cuda", rank)
+    handles_a, ws, meta = create_workspace(rank, world_size, dtype)
+    keep = [handles_a]  # peer buffers must stay alive while any table entry points at them
+    table_ptr = ws.data_ptr()
+    calls = Calls()
+    shapes = [(64, HIDDEN_DIM), (7, 4096)]
+    graph, xs, outs = _capture(rank, world_size, ws, meta, dtype, device, shapes, calls)
+    _replay_checked(rank, world_size, graph, xs, outs, shapes, dtype, device, calls, "before replacement")
+    n = world_size
+    for rnd in range(1, rounds + 1):
+        handles_b, ws_b, meta_b = create_workspace(rank, world_size, dtype)  # new buffers, new flags (all ranks)
+        keep.append(handles_b)
+        old = ws.clone()
+        ws.copy_(ws_b)  # rewrite the pointer table in place: the graph baked only the table's address
+        torch.cuda.synchronize()
+        assert ws.data_ptr() == table_ptr, "pointer table moved"
+        # every Lamport data pointer (entries 2n..3n) and the control-flag pointer (entry 3n) must have changed
+        changed = (ws[2 * n:3 * n + 1] != old[2 * n:3 * n + 1]).all().item()
+        assert changed, f"round {rnd}: table entries did not change: {old[2*n:3*n+1].tolist()} -> {ws[2*n:3*n+1].tolist()}"
+        dist.barrier()  # all ranks switched before anyone replays
+        for rep in range(2):
+            _replay_checked(rank, world_size, graph, xs, outs, shapes, dtype, device, calls, f"round {rnd} rep {rep}")
+        gather_checked(rank, world_size, ws, meta_b, dtype, device, (5, HIDDEN_DIM), calls)  # eager on the new table
+        _replay_checked(rank, world_size, graph, xs, outs, shapes, dtype, device, calls, f"round {rnd} after eager")
+    dist.barrier()
+    del graph
+    for h in keep:
+        comm.trtllm_destroy_ipc_workspace_for_all_reduce_fusion(h)
+
+
+# ----------------------------------------------------------------------------------------------------------------
+# scenario 3: back-to-back calls, no intermediate sync, irregular sizes, per-rank skew, alternation with allreduce
+# ----------------------------------------------------------------------------------------------------------------
+ASYNC_SHAPES = [(256, HIDDEN_DIM), (1, 4096), (200, HIDDEN_DIM), (1, 4096), (1, 4096), (1, 4096), (1, 4096),
+                (3, HIDDEN_DIM), (130, HIDDEN_DIM), (2, 4096), (256, HIDDEN_DIM), (9, HIDDEN_DIM), (1, 8), (255, HIDDEN_DIM)]
+
+
+def s_async_sequences(world_size, rank, dtype):
+    device = torch.device("cuda", rank)
+    handles, ws, meta = create_workspace(rank, world_size, dtype)
+    calls = Calls()
+    for skew in (False, True):
+        ids = [calls.next() for _ in ASYNC_SHAPES]
+        xs = [make_input(rank, c, s, dtype, device) for c, s in zip(ids, ASYNC_SHAPES)]
+        outs = [torch.empty((world_size,) + s, dtype=dtype, device=device) for s in ASYNC_SHAPES]
+        torch.cuda.synchronize()
+        dist.barrier()
+        for k, s in enumerate(ASYNC_SHAPES):  # nothing but kernel launches from here to the final sync
+            if skew and k % 3 == rank % 3:
+                torch.cuda._sleep(int(2e6) * (rank + 1))  # delay this rank's next call, keep collective order
+            comm.trtllm_allgather(xs[k], outs[k], world_size, rank, ws, metadata=meta)
+        torch.cuda.synchronize()
+        for k, s in enumerate(ASYNC_SHAPES):
+            check_bits(outs[k], expected_gather(world_size, ids[k], s, dtype, device), f"async skew={skew} call {k} shape {s}")
+    # alternate with the one-shot allreduce on the same workspace: both advance the slot rotation by update(size*N)
+    shape = (16, 4096)
+    ar_in, ar_out, ar_ref, ag_out, ag_ids = [], [], [], [], []
+    for _ in range(6):
+        c = calls.next()
+        ag_ids.append(c)
+        ag_out.append(torch.empty((world_size,) + shape, dtype=dtype, device=device))
+        c2 = calls.next()
+        xin = torch.stack([make_input(r, c2, shape, dtype, device) for r in range(world_size)])
+        xin = xin.nan_to_num(0.0, 0.0, 0.0).clamp(-64, 64)  # finite, small: the reduction must not overflow
+        ar_in.append(xin[rank].contiguous())
+        ar_ref.append(xin.float().sum(0))
+        ar_out.append(torch.empty(shape, dtype=dtype, device=device))
+    ag_in = [make_input(rank, c, shape, dtype, device) for c in ag_ids]
+    torch.cuda.synchronize()
+    dist.barrier()
+    for i in range(6):
+        comm.trtllm_allgather(ag_in[i], ag_out[i], world_size, rank, ws, metadata=meta)
+        comm.trtllm_allreduce_fusion(
+            allreduce_in=ar_in[i], world_size=world_size, world_rank=rank, token_num=shape[0], hidden_dim=shape[1],
+            workspace_ptrs=ws, launch_with_pdl=False, trigger_completion_at_end=True, fp32_acc=True,
+            pattern_code=AllReduceFusionPattern.kAllReduce, use_oneshot=True, allreduce_out=ar_out[i],
+            residual_in=None, residual_out=None, norm_out=None, quant_out=None, scale_out=None, rms_gamma=None,
+            rms_eps=None, scale_factor=None, layout_code=None,
         )
-        call = 0
-        # eager: 3 passes over the shapes exercise the mod-3 Lamport slot rotation and the clear path
-        for _ in range(3):
-            for shape in SHAPES:
-                x = _make_input(rank, call, shape, dtype, device)
-                out = torch.empty((world_size,) + shape, dtype=dtype, device=device)
-                comm.trtllm_allgather(x, out, world_size, rank, workspace, metadata=metadata)
-                torch.cuda.synchronize()
-                torch.testing.assert_close(out, _expected(world_size, call, shape, dtype, device), rtol=0, atol=0)
-                call += 1
-        # CUDA graph: three calls recorded once, replayed with changing inputs
-        shape = SHAPES[0]
-        xs = [torch.empty(shape, dtype=dtype, device=device) for _ in range(3)]
-        outs = [torch.empty((world_size,) + shape, dtype=dtype, device=device) for _ in range(3)]
-        stream = torch.cuda.Stream()
-        with torch.cuda.stream(stream):
-            for i in range(3):
-                xs[i].copy_(_make_input(rank, call + i, shape, dtype, device))
-                comm.trtllm_allgather(xs[i], outs[i], world_size, rank, workspace, metadata=metadata)
-        torch.cuda.synchronize()
-        dist.barrier(group=group)
-        graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(graph, stream=stream):
-            for i in range(3):
-                comm.trtllm_allgather(xs[i], outs[i], world_size, rank, workspace, metadata=metadata)
-        torch.cuda.synchronize()
-        dist.barrier(group=group)
-        for replay in range(5):
-            base = call + 100 + 3 * replay
-            for i in range(3):
-                xs[i].copy_(_make_input(rank, base + i, shape, dtype, device))
-            graph.replay()
-            torch.cuda.synchronize()
-            for i in range(3):
-                torch.testing.assert_close(outs[i], _expected(world_size, base + i, shape, dtype, device), rtol=0, atol=0)
-        # capacity check must refuse a message larger than the Lamport slot
-        too_big = torch.empty((MAX_TOKEN_NUM + 1, hidden_dim), dtype=dtype, device=device)
+    torch.cuda.synchronize()
+    for i in range(6):
+        check_bits(ag_out[i], expected_gather(world_size, ag_ids[i], shape, dtype, device), f"alternation gather {i}")
+        torch.testing.assert_close(ar_out[i].float(), ar_ref[i], rtol=2e-2, atol=2e-1,
+                                   msg=lambda m, i=i: f"alternation allreduce {i}: {m}")
+    dist.barrier()
+    comm.trtllm_destroy_ipc_workspace_for_all_reduce_fusion(handles)
+
+
+# ----------------------------------------------------------------------------------------------------------------
+# scenario 4: boundary sizes and alignment
+# ----------------------------------------------------------------------------------------------------------------
+def s_boundaries(world_size, rank, dtype):
+    device = torch.device("cuda", rank)
+    handles, ws, meta = create_workspace(rank, world_size, dtype)
+    calls = Calls()
+    vec = VEC[dtype]
+    cap = capacity_elems(meta, world_size, dtype)
+    sizes = sorted({vec, 2 * vec, 127 * vec, 128 * vec, 129 * vec, 1023 * vec, 1024 * vec, 1025 * vec,
+                    4095 * vec, 4096 * vec, 4097 * vec, (148 * 1024 - 1) * vec, 148 * 1024 * vec,
+                    (148 * 1024 + 1) * vec, (148 * 4096 - 1) * vec, 148 * 4096 * vec, (148 * 4096 + 1) * vec,
+                    cap - vec, cap})
+    for n in sizes:
+        assert n <= cap
+        gather_checked(rank, world_size, ws, meta, dtype, device, (n,), calls)
+    # empty input: a documented no-op; the output is left untouched and the rotation is unaffected
+    out = torch.full((world_size, 0), 0.0, dtype=dtype, device=device)
+    comm.trtllm_allgather(torch.empty(0, dtype=dtype, device=device), out, world_size, rank, ws, metadata=meta)
+    gather_checked(rank, world_size, ws, meta, dtype, device, (3, vec), calls)
+    # aligned slices with a non-zero storage offset are fine
+    base = torch.empty(16 * vec + 2 * vec, dtype=dtype, device=device)
+    obase = torch.empty(world_size * 16 * vec + 2 * vec, dtype=dtype, device=device)
+    c = calls.next()
+    x = base[2 * vec:2 * vec + 16 * vec]
+    x.copy_(make_input(rank, c, (16 * vec,), dtype, device))
+    o = obase[2 * vec:2 * vec + world_size * 16 * vec].view(world_size, 16 * vec)
+    comm.trtllm_allgather(x, o, world_size, rank, ws, metadata=meta)
+    torch.cuda.synchronize()
+    check_bits(o, expected_gather(world_size, c, (16 * vec,), dtype, device), "aligned slice")
+    # rejected before any launch: odd storage offset (input or output), non-vector size, over capacity,
+    # wrong output shape, wrong dtype for the workspace, wrong world_size against metadata
+    good_out = torch.empty((world_size, 16 * vec), dtype=dtype, device=device)
+    bad_cases = {
+        "input offset 1 element": (base[1:1 + 16 * vec], good_out, meta, world_size),
+        "output offset 1 element": (base[:16 * vec], obase[1:1 + world_size * 16 * vec].view(world_size, 16 * vec), meta, world_size),
+        "numel not a vector multiple": (base[:vec + 1], torch.empty((world_size, vec + 1), dtype=dtype, device=device), meta, world_size),
+        "one vector over capacity": (torch.empty(cap + vec, dtype=dtype, device=device),
+                                     torch.empty((world_size, cap + vec), dtype=dtype, device=device), meta, world_size),
+        "output shape mismatch": (base[:16 * vec], torch.empty((world_size, 8 * vec), dtype=dtype, device=device), meta, world_size),
+        "world_size vs metadata": (base[:16 * vec], torch.empty((world_size + 1, 16 * vec), dtype=dtype, device=device), meta, world_size + 1),
+        "dtype vs workspace": (torch.empty(16 * vec, dtype=torch.float32 if dtype != torch.float32 else torch.float16, device=device),
+                               torch.empty((world_size, 16 * vec), dtype=torch.float32 if dtype != torch.float32 else torch.float16, device=device),
+                               meta, world_size),
+        "non-contiguous input": (torch.empty((16, 2 * vec), dtype=dtype, device=device)[:, ::2],
+                                 torch.empty((world_size, 16, vec), dtype=dtype, device=device), meta, world_size),
+    }
+    for name, (xi, oi, m, wsz) in bad_cases.items():
         with pytest.raises(ValueError):
-            comm.trtllm_allgather(
-                too_big,
-                torch.empty((world_size,) + too_big.shape, dtype=dtype, device=device),
-                world_size,
-                rank,
-                workspace,
-                metadata=metadata,
-            )
-        dist.barrier(group=group)
-        comm.trtllm_destroy_ipc_workspace_for_all_reduce_fusion(ipc_handles, group=group)
-    finally:
-        dist.barrier(group=group)
-        dist.destroy_process_group(group=group)
+            comm.trtllm_allgather(xi, oi, wsz, rank, ws, metadata=m)
+    torch.cuda.synchronize()  # nothing was launched: the device-side error state must be clean
+    gather_checked(rank, world_size, ws, meta, dtype, device, (5, HIDDEN_DIM), calls)  # still healthy afterwards
+    dist.barrier()
+    comm.trtllm_destroy_ipc_workspace_for_all_reduce_fusion(handles)
 
 
-def get_open_port() -> int:
-    try:
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-            s.bind(("127.0.0.1", 0))
-            return s.getsockname()[1]
-    except OSError:
-        with socket.socket(socket.AF_INET6, socket.SOCK_STREAM) as s:
-            s.bind(("::1", 0))
-            return s.getsockname()[1]
+# ----------------------------------------------------------------------------------------------------------------
+# scenario 6: execution variants
+# ----------------------------------------------------------------------------------------------------------------
+def s_variants(world_size, rank, dtype):
+    device = torch.device("cuda", rank)
+    handles, ws, meta = create_workspace(rank, world_size, dtype)
+    calls = Calls()
+    for pdl in (False, True):
+        for trigger in (True, False):
+            for shape in ((64, HIDDEN_DIM), (1, 4096), (7, HIDDEN_DIM)):
+                gather_checked(rank, world_size, ws, meta, dtype, device, shape, calls,
+                               launch_with_pdl=pdl, trigger_completion_at_end=trigger)
+            graph, xs, outs = _capture(rank, world_size, ws, meta, dtype, device, GRAPH_SHAPES[:2], calls,
+                                       launch_with_pdl=pdl, trigger_completion_at_end=trigger)
+            _replay_checked(rank, world_size, graph, xs, outs, GRAPH_SHAPES[:2], dtype, device, calls,
+                            f"pdl={pdl} trigger={trigger}")
+            del graph
+    dist.barrier()
+    comm.trtllm_destroy_ipc_workspace_for_all_reduce_fusion(handles)
 
 
-def multi_process_parallel(world_size: int, dtype: torch.dtype, hidden_dim: int, test_target: Any) -> None:
-    mp.set_start_method("spawn", force=True)
-    procs = []
-    distributed_init_port = get_open_port()
-    for i in range(world_size):
-        proc = mp.Process(
-            target=test_target,
-            args=(world_size, i, dtype, hidden_dim, distributed_init_port),
-            name=f"Worker-{i}",
-        )
-        proc.start()
-        procs.append(proc)
-    for i in range(world_size):
-        procs[i].join()
-        assert procs[i].exitcode == 0, f"Process {i} failed with exit code {procs[i].exitcode}"
+# ----------------------------------------------------------------------------------------------------------------
+# scenario 7: harness self-tests
+# ----------------------------------------------------------------------------------------------------------------
+def s_one_rank_raises(world_size, rank, dtype):
+    if rank == 1:
+        raise RuntimeError("deliberate failure on rank 1")
+    dist.barrier()  # the healthy rank blocks here; the harness must still report and kill it
 
 
-# Run as: python tests/comm/test_trtllm_allgather.py
-@pytest.mark.parametrize("world_size", [2, 4, 8])
+def s_one_rank_stalls(world_size, rank, dtype):
+    if rank == 1:
+        time.sleep(3600)
+    dist.barrier()
+
+
+# ----------------------------------------------------------------------------------------------------------------
+# pytest entry points
+# ----------------------------------------------------------------------------------------------------------------
+@pytest.mark.parametrize("world_size", WORLD_SIZES)
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
+def test_eager_bit_exact(world_size, dtype):
+    _need_gpus(world_size)
+    run_workers(s_eager, world_size, dtype)
+
+
+@pytest.mark.parametrize("world_size", WORLD_SIZES)
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-def test_trtllm_allgather(world_size, dtype):
-    available_gpus = torch.cuda.device_count()
-    if world_size > available_gpus:
-        pytest.skip(f"world_size {world_size} is greater than available_gpus {available_gpus}")
-    multi_process_parallel(world_size, dtype, HIDDEN_DIM, _run_allgather_worker)
-    print(f"trtllm_allgather tp = {world_size} ({dtype}): OK")
+def test_graph_lengths_and_phases(world_size, dtype):
+    _need_gpus(world_size)
+    run_workers(s_graph_phases, world_size, dtype)
+
+
+@pytest.mark.parametrize("world_size", WORLD_SIZES)
+@pytest.mark.parametrize("dtype", [torch.bfloat16])
+def test_workspace_replacement_without_recapture(world_size, dtype):
+    _need_gpus(world_size)
+    run_workers(s_workspace_replacement, world_size, dtype)
+
+
+@pytest.mark.parametrize("world_size", WORLD_SIZES)
+@pytest.mark.parametrize("dtype", [torch.bfloat16])
+def test_async_sequences_and_allreduce_alternation(world_size, dtype):
+    _need_gpus(world_size)
+    run_workers(s_async_sequences, world_size, dtype)
+
+
+@pytest.mark.parametrize("world_size", WORLD_SIZES)
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_boundaries_and_alignment(world_size, dtype):
+    _need_gpus(world_size)
+    run_workers(s_boundaries, world_size, dtype)
+
+
+@pytest.mark.parametrize("world_size", WORLD_SIZES)
+@pytest.mark.parametrize("dtype", [torch.bfloat16])
+def test_execution_variants(world_size, dtype):
+    _need_gpus(world_size)
+    run_workers(s_variants, world_size, dtype)
+
+
+def test_harness_reports_worker_failure():
+    _need_gpus(2)
+    t = time.monotonic()
+    with pytest.raises(HarnessFailure, match="rank1 exited"):
+        run_workers(s_one_rank_raises, 2, torch.bfloat16, timeout_s=120)
+    assert time.monotonic() - t < 90, "a failing worker must be reported promptly, not at the deadline"
+
+
+def test_harness_reports_stalled_worker():
+    _need_gpus(2)
+    with pytest.raises(HarnessFailure, match="timeout"):
+        run_workers(s_one_rank_stalls, 2, torch.bfloat16, timeout_s=25)
 
 
 if __name__ == "__main__":
-    for ws in (2, 4):
-        for dt in (torch.float16, torch.bfloat16):
-            test_trtllm_allgather(ws, dt)
+    sys.exit(pytest.main([__file__, "-rA", "-v"]))
