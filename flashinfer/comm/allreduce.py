@@ -64,6 +64,7 @@ from flashinfer.utils import is_confidential_compute
 
 from .trtllm_ar import trtllm_allreduce_fusion
 from .trtllm_ar import trtllm_create_ipc_workspace_for_all_reduce_fusion
+from .trtllm_ar import trtllm_destroy_ipc_workspace_for_all_reduce_fusion
 from .trtllm_ar import _initialize_allreduce_fusion_protocol
 from .trtllm_ar import check_trtllm_allreduce_fusion_workspace_metadata
 from .trtllm_ar import trtllm_moe_allreduce_fusion
@@ -263,14 +264,26 @@ class TRTLLMAllReduceFusionWorkspace(AllReduceFusionWorkspace):
         comm_backend.barrier()
 
     def destroy(self) -> None:
-        """Destroy workspace and free resources."""
+        """Destroy workspace and free resources.
+
+        Drops every reference that keeps the workspace buffers alive: the module
+        registry entry (``_symm_workspace_refs``, keyed by the ipc_handles list),
+        the internal creation tuple and the public attributes. With no references
+        left the ``SymmDeviceMemory`` objects are collected and release their
+        mappings and physical backing. Deleting only the public attributes (the
+        previous behaviour) kept the allocation alive for the life of the process,
+        so repeated destroy/recreate cycles accumulated device memory.
+        """
         if getattr(self, "_destroyed", False):
             return  # Already destroyed, nothing to do
 
-        del self.ipc_handles
-        del self.workspace_tensor
-        del self.mem_handles
-        del self.metadata
+        ipc_handles = getattr(self, "ipc_handles", None)
+        if ipc_handles is not None:
+            trtllm_destroy_ipc_workspace_for_all_reduce_fusion(ipc_handles)
+        for name in ("ipc_handles", "workspace_tensor", "mem_handles", "metadata"):
+            if name in self.__dict__:
+                delattr(self, name)
+        self._internal_workspace = None
         self._destroyed = True
 
 
