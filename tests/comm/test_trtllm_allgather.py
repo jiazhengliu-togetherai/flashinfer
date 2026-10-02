@@ -126,12 +126,14 @@ def _worker_main(fn: Callable, world_size: int, rank: int, dtype: torch.dtype, p
         os._exit(1)
 
 
-def run_workers(fn: Callable, world_size: int, dtype: torch.dtype, timeout_s: float = 600.0, **kwargs) -> None:
-    """Spawn one process per rank; fail promptly on any non-zero exit; kill the rest on failure or deadline."""
+def run_workers(fn: Callable, world_size: int, dtype: torch.dtype, timeout_s: float = 600.0, _procs=None, **kwargs) -> None:
+    """Spawn one process per rank; fail promptly on any non-zero exit; kill the rest on failure or deadline.
+    Exit codes are re-checked after joining: a worker that dies between the failure scan and the all-stopped
+    check must not turn into a pass. `_procs` injects process stand-ins for the harness's own tests."""
     ctx = mp.get_context("spawn")
     master = dist.TCPStore("127.0.0.1", 0, world_size, is_master=True, wait_for_workers=False)  # held until the end
     port = master.port
-    procs = [
+    procs = _procs if _procs is not None else [
         ctx.Process(target=_worker_main, args=(fn, world_size, r, dtype, port, kwargs), name=f"rank{r}")
         for r in range(world_size)
     ]
@@ -150,12 +152,16 @@ def run_workers(fn: Callable, world_size: int, dtype: torch.dtype, timeout_s: fl
             failure = f"timeout after {timeout_s:.0f}s; still running: {[p.name for p in procs if p.is_alive()]}"
             break
         time.sleep(0.1)
-    for p in procs:
-        if p.is_alive():
-            p.kill()
+    killed = [p for p in procs if p.is_alive()]
+    for p in killed:
+        p.kill()
     for p in procs:
         p.join(10)
     del master
+    if failure is None:  # unconditional final verdict from the exit codes
+        bad = [p for p in procs if p.exitcode != 0]
+        if bad:
+            failure = f"{bad[0].name} exited with code {bad[0].exitcode} (noticed after join)"
     if failure:
         raise HarnessFailure(f"{fn.__name__} (world_size={world_size}, {dtype}): {failure}")
 
@@ -213,6 +219,45 @@ def gather_checked(rank, world_size, ws, meta, dtype, device, shape, calls: Call
         check_bits(out, expected_gather(world_size, call, shape, dtype, device), f"eager call {call} shape {tuple(shape)}")
         log(rank, f"  collective {1e3*(t1-t0):.2f} ms, check {1e3*(time.perf_counter()-t1):.1f} ms")
     return call, out
+
+
+def _read_i32(ptr: int, n: int) -> list[int]:
+    """Read n int32 from device address ptr (control block: counter, non-lamport flag, lamport flag, stride, clear)."""
+    from ctypes import c_int32, c_void_p, cast
+
+    from flashinfer.comm.cuda_ipc import cudart
+
+    torch.cuda.synchronize()
+    buf = (c_int32 * n)()
+    cudart.cudaMemcpy(cast(buf, c_void_p), c_void_p(ptr), 4 * n)
+    return list(buf)
+
+
+def _read_bytes(ptr: int, n: int) -> bytes:
+    from ctypes import c_void_p, cast, create_string_buffer
+
+    from flashinfer.comm.cuda_ipc import cudart
+
+    torch.cuda.synchronize()
+    buf = create_string_buffer(n)
+    cudart.cudaMemcpy(cast(buf, c_void_p), c_void_p(ptr), n)
+    return buf.raw
+
+
+def _memset(ptr: int, value: int, n: int) -> None:
+    from ctypes import c_void_p
+
+    from flashinfer.comm.cuda_ipc import cudart
+
+    torch.cuda.synchronize()
+    cudart.cudaMemset(c_void_p(ptr), value, n)
+    torch.cuda.synchronize()
+
+
+def _table_ptrs(ws: torch.Tensor, n: int, rank: int) -> tuple[int, int]:
+    """(own Lamport data buffer, control block) addresses from a workspace pointer table."""
+    t = ws.tolist()
+    return t[2 * n + rank], t[3 * n]
 
 
 # ----------------------------------------------------------------------------------------------------------------
@@ -283,9 +328,13 @@ def s_graph_phases(world_size, rank, dtype):
     handles, ws, meta = create_workspace(rank, world_size, dtype)
     calls = Calls()
     for offset in (0, 1, 2):
-        for _ in range(offset):  # shift the slot phase before capturing
-            gather_checked(rank, world_size, ws, meta, dtype, device, (2, 4096), calls)
         for ncalls in (1, 2, 4, 5):
+            # every collective is one call id, so calls.n % 3 is the slot the next call will use;
+            # advance explicitly to the intended phase (a fixed number of extra calls would not,
+            # since each case below consumes 6*ncalls + 3 calls and keeps the phase it started with)
+            while calls.n % 3 != offset:
+                gather_checked(rank, world_size, ws, meta, dtype, device, (2, 4096), calls)
+            log(rank, f"case offset={offset} ncalls={ncalls} starts at phase {calls.n % 3}")
             shapes = GRAPH_SHAPES[:ncalls]
             graph, xs, outs = _capture(rank, world_size, ws, meta, dtype, device, shapes, calls)
             for rep in range(3):
@@ -304,30 +353,62 @@ def s_graph_phases(world_size, rank, dtype):
 # scenario 1: replace the workspace's peer buffers and control flags in place; replay the original graph
 # ----------------------------------------------------------------------------------------------------------------
 def s_workspace_replacement(world_size, rank, dtype, rounds: int = 3):
+    """A graph recorded against workspace A must run on whatever the table points to after an in-place rewrite.
+    Verified by state, not only by output: the retired workspace's control block and Lamport slots must stay
+    untouched (poisoned slots keep their poison, flag does not advance) while the new workspace's flag advances by
+    exactly the number of replayed calls and its own slot receives the pushed data."""
     device = torch.device("cuda", rank)
     handles_a, ws, meta = create_workspace(rank, world_size, dtype)
-    keep = [handles_a]  # peer buffers must stay alive while any table entry points at them
+    keep = [handles_a]  # retired buffers stay mapped so a stale pointer would read/write them, not fault
     table_ptr = ws.data_ptr()
     calls = Calls()
+    n = world_size
+    stride = meta["lamport_comm_size"]
     shapes = [(64, HIDDEN_DIM), (7, 4096)]
     graph, xs, outs = _capture(rank, world_size, ws, meta, dtype, device, shapes, calls)
     _replay_checked(rank, world_size, graph, xs, outs, shapes, dtype, device, calls, "before replacement")
-    n = world_size
+    cur_data, cur_ctrl = _table_ptrs(ws, n, rank)
     for rnd in range(1, rounds + 1):
-        handles_b, ws_b, meta_b = create_workspace(rank, world_size, dtype)  # new buffers, new flags (all ranks)
+        handles_b, ws_b, meta_b = create_workspace(rank, world_size, dtype)  # new buffers, new control block
         keep.append(handles_b)
-        old = ws.clone()
+        assert meta_b["lamport_comm_size"] == stride
+        old_data, old_ctrl = cur_data, cur_ctrl
+        new_data, new_ctrl = _table_ptrs(ws_b, n, rank)
+        assert new_data != old_data and new_ctrl != old_ctrl
+        old_flag_before = _read_i32(old_ctrl, 5)
+        # retire A: poison every slot of my A buffer so any stale push from any rank's graph shows
+        dist.barrier()  # nobody is still using A
+        _memset(old_data, 0x55, 3 * stride)
         ws.copy_(ws_b)  # rewrite the pointer table in place: the graph baked only the table's address
         torch.cuda.synchronize()
         assert ws.data_ptr() == table_ptr, "pointer table moved"
-        # every Lamport data pointer (entries 2n..3n) and the control-flag pointer (entry 3n) must have changed
-        changed = (ws[2 * n:3 * n + 1] != old[2 * n:3 * n + 1]).all().item()
-        assert changed, f"round {rnd}: table entries did not change: {old[2*n:3*n+1].tolist()} -> {ws[2*n:3*n+1].tolist()}"
         dist.barrier()  # all ranks switched before anyone replays
+        ncalls = 0
         for rep in range(2):
             _replay_checked(rank, world_size, graph, xs, outs, shapes, dtype, device, calls, f"round {rnd} rep {rep}")
+            ncalls += len(shapes)
         gather_checked(rank, world_size, ws, meta_b, dtype, device, (5, HIDDEN_DIM), calls)  # eager on the new table
+        ncalls += 1
         _replay_checked(rank, world_size, graph, xs, outs, shapes, dtype, device, calls, f"round {rnd} after eager")
+        ncalls += len(shapes)
+        torch.cuda.synchronize()
+        dist.barrier()  # every rank's kernels for this round have finished before inspecting state
+        old_flag_after = _read_i32(old_ctrl, 5)
+        new_flag = _read_i32(new_ctrl, 5)
+        assert old_flag_after == old_flag_before, f"round {rnd}: retired control block changed {old_flag_before} -> {old_flag_after}"
+        assert new_flag[2] == ncalls % 3 and new_flag[0] == 0, f"round {rnd}: new control block {new_flag}, expected flag {ncalls % 3}"
+        for slot in range(3):
+            head = _read_bytes(old_data + slot * stride, 256)
+            assert head == b"\x55" * 256, f"round {rnd}: retired slot {slot} was written after retirement"
+        # the last replay's last call pushed every rank's slice into my new buffer at slot (ncalls-1) % 3
+        last_shape = shapes[-1]
+        numel = last_shape[0] * last_shape[1]
+        slot = (ncalls - 1) % 3
+        es = torch.tensor([], dtype=dtype).element_size()
+        got = _read_bytes(new_data + slot * stride, numel * es * n)
+        want = normalize_ref(expected_gather(world_size, calls.n, last_shape, dtype, device)).contiguous().cpu().view(torch.uint8).numpy().tobytes()
+        assert got == want, f"round {rnd}: new workspace slot {slot} does not hold the last gathered data"
+        cur_data, cur_ctrl = new_data, new_ctrl
     dist.barrier()
     del graph
     for h in keep:
@@ -470,6 +551,27 @@ def s_variants(world_size, rank, dtype):
 
 
 # ----------------------------------------------------------------------------------------------------------------
+# slot stride: a workspace whose tp*max_token*hidden*itemsize is not a multiple of 16 must still work call after call
+# ----------------------------------------------------------------------------------------------------------------
+def s_small_workspace(world_size, rank, dtype):
+    device = torch.device("cuda", rank)
+    handles, ws, meta = create_workspace(rank, world_size, dtype, max_token_num=1, hidden_dim=9)
+    stride = meta["lamport_comm_size"]
+    raw = world_size * 1 * 9 * torch.tensor([], dtype=dtype).element_size()
+    assert stride % 16 == 0 and stride >= raw, f"slot stride {stride} (raw {raw})"
+    calls = Calls()
+    vec = VEC[dtype]
+    cap = capacity_elems(meta, world_size, dtype)
+    for _ in range(7):  # more than two full slot rotations; slots 1 and 2 were the misaligned ones
+        gather_checked(rank, world_size, ws, meta, dtype, device, (vec,), calls)
+    if cap >= 2 * vec:
+        for _ in range(3):
+            gather_checked(rank, world_size, ws, meta, dtype, device, (2 * vec,), calls)
+    dist.barrier()
+    comm.trtllm_destroy_ipc_workspace_for_all_reduce_fusion(handles)
+
+
+# ----------------------------------------------------------------------------------------------------------------
 # scenario 7: harness self-tests
 # ----------------------------------------------------------------------------------------------------------------
 def s_one_rank_raises(world_size, rank, dtype):
@@ -527,6 +629,55 @@ def test_boundaries_and_alignment(world_size, dtype):
 def test_execution_variants(world_size, dtype):
     _need_gpus(world_size)
     run_workers(s_variants, world_size, dtype)
+
+
+@pytest.mark.parametrize("world_size", WORLD_SIZES)
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_small_workspace_slot_stride(world_size, dtype):
+    _need_gpus(world_size)
+    run_workers(s_small_workspace, world_size, dtype)
+
+
+def test_wrapper_rejects_misaligned_slot_stride():
+    """A workspace whose slot stride is not a multiple of 16 B is refused before launch (CPU-only check)."""
+    x = torch.zeros(8, dtype=torch.float16)
+    out = torch.zeros((2, 8), dtype=torch.float16)
+    meta = {"lamport_comm_size": 36, "tp_size": 2, "use_fp32_lamport": False}
+    with pytest.raises(ValueError, match="slot stride"):
+        comm.trtllm_allgather(x, out, 2, 0, torch.zeros(7, dtype=torch.int64), metadata=meta)
+
+
+class _FakeProc:
+    """Process stand-in: alive on the first scan, then exited with the given code (the race the harness must catch)."""
+
+    def __init__(self, name: str, exitcode: int, alive_scans: int = 1):
+        self.name, self._exit, self._alive, self.killed = name, exitcode, alive_scans, False
+
+    def start(self):
+        pass
+
+    def is_alive(self):
+        if self._alive > 0:
+            self._alive -= 1
+            return True
+        return False
+
+    @property
+    def exitcode(self):
+        return None if self._alive > 0 else self._exit
+
+    def kill(self):
+        self.killed = True
+
+    def join(self, timeout=None):
+        pass
+
+
+def test_harness_catches_exit_between_scans():
+    """Workers that die between the failed-worker scan and the all-stopped check must still fail the run."""
+    with pytest.raises(HarnessFailure, match="noticed after join"):
+        run_workers(s_eager, 2, torch.bfloat16, timeout_s=5, _procs=[_FakeProc("rank0", 1), _FakeProc("rank1", 1)])
+    run_workers(s_eager, 2, torch.bfloat16, timeout_s=5, _procs=[_FakeProc("rank0", 0), _FakeProc("rank1", 0)])
 
 
 def test_harness_reports_worker_failure():
