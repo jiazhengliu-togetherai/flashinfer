@@ -16,6 +16,7 @@ limitations under the License.
 
 import functools
 import logging
+import sys
 from ctypes import c_void_p, cast, create_string_buffer
 from types import SimpleNamespace
 from typing import List, Optional, Tuple, Union
@@ -415,7 +416,23 @@ def get_trtllm_comm_module():
             weight_bias,
         )
 
+    @register_custom_op("flashinfer::trtllm_allgather", mutates_args=["output"])
+    def trtllm_allgather(
+        input: torch.Tensor,
+        output: torch.Tensor,
+        size: int,
+        world_size: int,
+        world_rank: int,
+        workspace_ptrs: torch.Tensor,
+        launch_with_pdl: bool,
+        trigger_completion_at_end: bool,
+    ) -> None:
+        module.trtllm_allgather(
+            input, output, size, world_size, world_rank, workspace_ptrs, launch_with_pdl, trigger_completion_at_end
+        )
+
     return SimpleNamespace(
+        trtllm_allgather=trtllm_allgather,
         trtllm_lamport_initialize=trtllm_lamport_initialize,
         trtllm_lamport_initialize_all=trtllm_lamport_initialize_all,
         trtllm_custom_all_reduce=trtllm_custom_all_reduce,
@@ -432,6 +449,31 @@ MAX_ALL_REDUCE_BLOCKS = 24
 LamportTokenNumThreshold = 16
 
 _symm_workspace_refs: dict[int, list[object]] = {}
+
+
+class _ControlBlock:
+    """Owner of a workspace's 20-byte control block (atomic counter, flags, slot
+    stride, clear size), cudaMalloc'ed once per workspace. It lives in the
+    workspace's registry entry and is freed exactly once by the destroy function
+    (or at collection as a fallback); before this the block leaked on every
+    destroy/recreate cycle."""
+
+    def __init__(self, ptr: int) -> None:
+        self.ptr = ptr
+        self.freed = False
+
+    def free(self) -> None:
+        if not self.freed and self.ptr:
+            cudart.cudaFree(c_void_p(self.ptr))
+            self.freed = True
+
+    def __del__(self) -> None:
+        if sys.is_finalizing():
+            return
+        try:
+            self.free()
+        except Exception:  # the CUDA context may already be gone at interpreter exit
+            pass
 
 
 @deprecated(
@@ -547,7 +589,10 @@ def trtllm_destroy_ipc_workspace_for_all_reduce(
         workspace: The ipc_handles list returned by the create function.
         group: Unused, kept for API compatibility.
     """
-    _symm_workspace_refs.pop(id(workspace), None)
+    refs = _symm_workspace_refs.pop(id(workspace), None)
+    for ref in refs or []:
+        if isinstance(ref, _ControlBlock):
+            ref.free()  # exactly once; a second destroy finds no registry entry
 
 
 BarrierFlagCount = 256
@@ -664,6 +709,10 @@ def trtllm_create_ipc_workspace_for_all_reduce_fusion(
             f"warning: lamport_comm_size {lamport_comm_size} is greater than MAX_COMM_SIZE {MAX_COMM_SIZE}, set to MAX_COMM_SIZE"
         )
         lamport_comm_size = MAX_COMM_SIZE
+    # lamport_comm_size is also the stride between the three Lamport slots; the kernels
+    # read and write the slots with 16-byte vectors, so an odd hidden_dim (e.g. 9) would
+    # put slots 1 and 2 at misaligned addresses. Round the stride up.
+    lamport_comm_size = round_up(lamport_comm_size, 16)
 
     lamport_buffer_size = lamport_comm_size * 3
 
@@ -762,8 +811,9 @@ def trtllm_create_ipc_workspace_for_all_reduce_fusion(
         c_void_p(flag_ptr.value + 3 * 4), cast(lamport_comm_size_bytes, c_void_p), 4
     )
     logger.debug("set flag_ptr[3] = lamport_comm_size: %s", lamport_comm_size)
-    # add flag_ptr to workspace
+    # add flag_ptr to workspace; the registry entry owns the block and frees it on destroy
     workspace.append(flag_ptr.value)
+    symm_refs.append(_ControlBlock(flag_ptr.value))
 
     for i in range(len(workspace)):
         logger.debug("Rank %s workspace[%d] %s", tp_rank, i, hex(workspace[i]))
@@ -813,7 +863,10 @@ def trtllm_destroy_ipc_workspace_for_all_reduce_fusion(
         workspace: The ipc_handles list returned by the create function.
         group: Unused, kept for API compatibility.
     """
-    _symm_workspace_refs.pop(id(workspace), None)
+    refs = _symm_workspace_refs.pop(id(workspace), None)
+    for ref in refs or []:
+        if isinstance(ref, _ControlBlock):
+            ref.free()  # exactly once; a second destroy finds no registry entry
 
 
 # allReduce fused quant utils
@@ -1317,4 +1370,58 @@ def trtllm_moe_finalize_allreduce_fusion(
         expert_scale_factor=expert_scale_factor,
         routed_scaling_factor=routed_scaling_factor,
         weight_bias=weight_bias,
+    )
+
+
+def trtllm_allgather(
+    input: torch.Tensor,
+    output: torch.Tensor,
+    world_size: int,
+    world_rank: int,
+    workspace_ptrs: torch.Tensor,
+    launch_with_pdl: bool = False,
+    trigger_completion_at_end: bool = True,
+    metadata: Optional[dict] = None,
+) -> None:
+    """All-gather on the Lamport one-shot protocol of an allreduce-fusion workspace (warm-clone E2).
+
+    output must be contiguous with shape (world_size, *input.shape); output[r] receives rank r's input. The kernel
+    reads peer pointers and flags from the workspace pointer table at run time, so a CUDA graph that records this
+    call stays valid when the workspace is re-created at the same address with new peer pointers. Capacity:
+    input.numel() * world_size * itemsize must fit lamport_comm_size (checked when metadata is given).
+    Requirements checked before launch (ValueError): dtype fp16/bf16/fp32; contiguous input and output; numel a
+    multiple of the 16-byte vector (8 fp16/bf16 or 4 fp32 elements); 16-byte aligned data pointers (a slice at an
+    odd storage offset is rejected). An empty input is a no-op. -0.0 inputs come out as +0.0 (Lamport sentinel).
+    """
+    if input.dtype not in (torch.float16, torch.bfloat16, torch.float32):
+        raise ValueError(f"trtllm_allgather: unsupported dtype {input.dtype} (float16, bfloat16, float32)")
+    if not (input.is_contiguous() and output.is_contiguous()):
+        raise ValueError("trtllm_allgather: input and output must be contiguous")
+    n = input.numel()
+    if output.numel() != n * world_size or output.dtype != input.dtype:
+        raise ValueError("trtllm_allgather: output must be [world_size, *input.shape] with input's dtype")
+    if n == 0:
+        return  # nothing to exchange; the Lamport slot rotation is left untouched on every rank
+    vec = 16 // input.element_size()  # the kernel moves 16-byte vectors
+    if n % vec != 0:
+        raise ValueError(f"trtllm_allgather: input.numel() ({n}) must be a multiple of {vec} elements (16-byte vectors)")
+    if input.data_ptr() % 16 != 0 or output.data_ptr() % 16 != 0:
+        raise ValueError("trtllm_allgather: input and output must start at 16-byte aligned addresses (slice at a multiple of 16 bytes)")
+    need = n * world_size * input.element_size()
+    if need > MAX_COMM_SIZE:
+        raise ValueError(f"trtllm_allgather: {need} B exceeds MAX_COMM_SIZE {MAX_COMM_SIZE} B")
+    if metadata is not None:
+        if metadata["lamport_comm_size"] % 16 != 0:
+            raise ValueError(
+                f"trtllm_allgather: workspace slot stride (lamport_comm_size {metadata['lamport_comm_size']} B) is not "
+                "16-byte aligned; slots 1 and 2 would be misaligned for the kernel's vector accesses"
+            )
+        if need > metadata["lamport_comm_size"]:
+            raise ValueError(f"trtllm_allgather: {need} B exceeds the workspace lamport_comm_size {metadata['lamport_comm_size']} B")
+        if metadata["tp_size"] != world_size:
+            raise ValueError(f"trtllm_allgather: world_size {world_size} != workspace tp_size {metadata['tp_size']}")
+        if metadata["use_fp32_lamport"] != (input.dtype == torch.float32):
+            raise ValueError("trtllm_allgather: dtype does not match the workspace's use_fp32_lamport")
+    get_trtllm_comm_module().trtllm_allgather(
+        input, output, n, world_size, world_rank, workspace_ptrs, launch_with_pdl, trigger_completion_at_end
     )

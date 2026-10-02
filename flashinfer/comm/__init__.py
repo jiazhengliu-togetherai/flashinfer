@@ -10,6 +10,7 @@ from .trtllm_ar import (
     compute_fp4_swizzled_layout_sf_size as compute_fp4_swizzled_layout_sf_size,
 )
 from .trtllm_ar import gen_trtllm_comm_module as gen_trtllm_comm_module
+from .trtllm_ar import trtllm_allgather as trtllm_allgather
 from .trtllm_ar import trtllm_allreduce_fusion as trtllm_allreduce_fusion
 from .trtllm_ar import (
     trtllm_create_ipc_workspace_for_all_reduce as trtllm_create_ipc_workspace_for_all_reduce,

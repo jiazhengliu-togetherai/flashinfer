@@ -31,6 +31,8 @@ pytest -s tests/comm/test_vllm_custom_allreduce.py
 # trtllm ar + fusion
 pytest -s tests/comm/test_trtllm_allreduce.py
 pytest -s tests/comm/test_trtllm_allreduce_fusion.py
+# trtllm all-gather on the allreduce-fusion workspace (checkpoint/restore-safe collective)
+pytest -s tests/comm/test_trtllm_allgather.py
 pytest -s tests/moe/test_trtllm_cutlass_fused_moe.py
 pytest -s tests/comm/test_trtllm_moe_allreduce_fusion.py
 pytest -s tests/comm/test_trtllm_moe_allreduce_fusion_finalize.py
