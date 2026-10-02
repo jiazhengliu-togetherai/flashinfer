@@ -48,6 +48,16 @@ WORLD_SIZES = [2, 4, 8, 16]
 GPUS = torch.cuda.device_count() if torch.cuda.is_available() else 0
 
 
+@pytest.fixture(scope="module", autouse=True)
+def _build_jit_module_once():
+    """Build/load the trtllm_comm JIT module in the parent before any ranks are spawned: with a cold JIT cache
+    every rank otherwise compiles the module concurrently (a rank was SIGKILLed once on a 224-core host)."""
+    if GPUS:
+        from flashinfer.comm.trtllm_ar import get_trtllm_comm_module
+
+        get_trtllm_comm_module()
+
+
 # ----------------------------------------------------------------------------------------------------------------
 # data: every rank can compute every other rank's input locally from (rank, call); values encode rank, position and
 # call so a swapped rank, a stale slot or a shifted element is visible; bit-exact comparison through integer views
@@ -585,6 +595,99 @@ def s_small_workspace(world_size, rank, dtype):
 
 
 # ----------------------------------------------------------------------------------------------------------------
+# resource lifecycle: the unified-API workspace must really release on destroy(); TP=2 -> destroy -> TP=4 in one process
+# ----------------------------------------------------------------------------------------------------------------
+def _unified_workspace(world_size, rank, dtype, group, max_token_num=64, hidden_dim=1024):
+    from flashinfer.comm.mnnvl import TorchDistBackend
+
+    return comm.create_allreduce_fusion_workspace(
+        backend="trtllm", world_size=world_size, rank=rank, max_token_num=max_token_num, hidden_dim=hidden_dim,
+        dtype=dtype, comm_backend=TorchDistBackend(group=group), group=group,
+    )
+
+
+def _gather_unified(ws_obj, world_size, rank, dtype, device, shape, calls: Calls, what: str):
+    call = calls.next()
+    x = make_input(rank, call, shape, dtype, device)
+    out = torch.empty((world_size,) + tuple(shape), dtype=dtype, device=device)
+    comm.trtllm_allgather(x, out, world_size, rank, ws_obj.workspace_tensor, metadata=ws_obj.metadata)
+    torch.cuda.synchronize()
+    check_bits(out, expected_gather(world_size, call, shape, dtype, device), what)
+
+
+def s_resource_release(world_size, rank, dtype, iterations: int = 6):
+    import gc
+    import weakref
+
+    from flashinfer.comm import trtllm_ar
+
+    device = torch.device("cuda", rank)
+    calls = Calls()
+    frees = []
+    for it in range(iterations):
+        ws_obj = _unified_workspace(world_size, rank, dtype, dist.group.WORLD)
+        key = id(ws_obj.ipc_handles)
+        assert key in trtllm_ar._symm_workspace_refs, "registry entry missing after creation"
+        handles_ref = [weakref.ref(h) for h in ws_obj.mem_handles]
+        assert handles_ref, "unified trtllm workspace without symmetric-memory handles"
+        _gather_unified(ws_obj, world_size, rank, dtype, device, (16, 1024), calls, f"iteration {it}")
+        dist.barrier()
+        ws_obj.destroy()
+        assert key not in trtllm_ar._symm_workspace_refs, f"iteration {it}: registry still holds the workspace"
+        assert ws_obj._internal_workspace is None
+        del ws_obj
+        gc.collect()
+        torch.cuda.synchronize()
+        dist.barrier()
+        alive = [r for r in handles_ref if r() is not None]
+        assert not alive, f"iteration {it}: {len(alive)} SymmDeviceMemory handle(s) still alive after destroy()"
+        frees.append(torch.cuda.mem_get_info(device)[0])
+    # after warm-up the free device memory must not keep going down (64 MiB tolerance for allocator noise)
+    assert frees[-1] >= frees[1] - (64 << 20), f"device memory not recovered across cycles: {[f >> 20 for f in frees]} MiB"
+
+
+def s_reinit_tp2_then_tp4(world_size, rank, dtype):
+    assert world_size == 4
+    device = torch.device("cuda", rank)
+    calls = Calls()
+    sub = dist.new_group([0, 1])
+    if rank < 2:
+        ws2 = _unified_workspace(2, rank, dtype, sub)
+        for _ in range(3):
+            _gather_unified(ws2, 2, rank, dtype, device, (16, 1024), calls, "tp2 phase")
+        dist.barrier(group=sub)
+        ws2.destroy()
+    else:
+        for _ in range(3):
+            calls.next()  # keep the call ids (= data patterns) identical on all ranks for the TP=4 phase
+    dist.barrier()
+    ws4 = _unified_workspace(4, rank, dtype, dist.group.WORLD)
+    for _ in range(3):
+        _gather_unified(ws4, 4, rank, dtype, device, (16, 1024), calls, "tp4 phase")
+    dist.barrier()
+    ws4.destroy()
+
+
+# ----------------------------------------------------------------------------------------------------------------
+# slot offsets beyond 2 GiB: clear slot 2 of a > 1 GiB slot (clear_offset * comm_size overflowed int32)
+# ----------------------------------------------------------------------------------------------------------------
+def s_large_slot(world_size, rank, dtype):
+    device = torch.device("cuda", rank)
+    # comm_size = world_size * max_token_num * hidden_dim * itemsize, just above 1 GiB so slot 2 starts above 2 GiB
+    hidden = 8
+    max_token = (1 << 30) // (world_size * hidden * 2) + 1
+    handles, ws, meta = create_workspace(rank, world_size, dtype, max_token_num=max_token, hidden_dim=hidden)
+    stride = meta["lamport_comm_size"]
+    assert stride > (1 << 30) and 2 * stride > (1 << 31), f"slot stride {stride}"
+    calls = Calls()
+    vec = VEC[dtype]
+    for shape in [(vec,), (64, hidden), (1024, hidden), (vec,), (4096, hidden), (vec,), (64, hidden)]:
+        gather_checked(rank, world_size, ws, meta, dtype, device, shape, calls)  # 7 calls: every slot cleared twice
+    dist.barrier()
+    comm.trtllm_destroy_ipc_workspace_for_all_reduce_fusion(handles)
+
+
+# ----------------------------------------------------------------------------------------------------------------
 # scenario 7: harness self-tests
 # ----------------------------------------------------------------------------------------------------------------
 def s_one_rank_raises(world_size, rank, dtype):
@@ -649,6 +752,27 @@ def test_execution_variants(world_size, dtype):
 def test_small_workspace_slot_stride(world_size, dtype):
     _need_gpus(world_size)
     run_workers(s_small_workspace, world_size, dtype)
+
+
+@pytest.mark.parametrize("world_size", WORLD_SIZES)
+@pytest.mark.parametrize("dtype", [torch.bfloat16])
+def test_unified_workspace_destroy_releases_resources(world_size, dtype):
+    _need_gpus(world_size)
+    run_workers(s_resource_release, world_size, dtype)
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16])
+def test_reinit_tp2_then_tp4_in_one_process(dtype):
+    _need_gpus(4)
+    run_workers(s_reinit_tp2_then_tp4, 4, dtype)
+
+
+@pytest.mark.parametrize("world_size", [2, 4])
+@pytest.mark.parametrize("dtype", [torch.float16])
+def test_slot_offsets_beyond_2gib(world_size, dtype):
+    """Each rank allocates ~4 GiB (three > 1 GiB slots + the fusion buffer)."""
+    _need_gpus(world_size)
+    run_workers(s_large_slot, world_size, dtype, timeout_s=900)
 
 
 def test_wrapper_rejects_misaligned_slot_stride():
