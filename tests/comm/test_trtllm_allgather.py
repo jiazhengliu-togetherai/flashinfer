@@ -628,6 +628,11 @@ def s_resource_release(world_size, rank, dtype, iterations: int = 6):
         ws_obj = _unified_workspace(world_size, rank, dtype, dist.group.WORLD)
         key = id(ws_obj.ipc_handles)
         assert key in trtllm_ar._symm_workspace_refs, "registry entry missing after creation"
+        blocks = [r for r in trtllm_ar._symm_workspace_refs[key] if isinstance(r, trtllm_ar._ControlBlock)]
+        assert len(blocks) == 1 and blocks[0].ptr == ws_obj.workspace_tensor.tolist()[3 * world_size], (
+            "the registry entry must own exactly the control block the pointer table points to"
+        )
+        control = blocks[0]
         handles_ref = [weakref.ref(h) for h in ws_obj.mem_handles]
         assert handles_ref, "unified trtllm workspace without symmetric-memory handles"
         _gather_unified(ws_obj, world_size, rank, dtype, device, (16, 1024), calls, f"iteration {it}")
@@ -635,6 +640,8 @@ def s_resource_release(world_size, rank, dtype, iterations: int = 6):
         ws_obj.destroy()
         assert key not in trtllm_ar._symm_workspace_refs, f"iteration {it}: registry still holds the workspace"
         assert ws_obj._internal_workspace is None
+        assert control.freed, f"iteration {it}: control block not freed by destroy()"
+        ws_obj.destroy()  # idempotent: no second free, no error
         del ws_obj
         gc.collect()
         torch.cuda.synchronize()
@@ -773,6 +780,24 @@ def test_slot_offsets_beyond_2gib(world_size, dtype):
     """Each rank allocates ~4 GiB (three > 1 GiB slots + the fusion buffer)."""
     _need_gpus(world_size)
     run_workers(s_large_slot, world_size, dtype, timeout_s=900)
+
+
+def test_control_block_freed_exactly_once(monkeypatch):
+    """The workspace's cudaMalloc'ed control block is owned by its registry entry and freed exactly once by the
+    destroy function (CPU-only: the CUDA runtime is stubbed)."""
+    from types import SimpleNamespace
+
+    from flashinfer.comm import trtllm_ar
+
+    freed: list[int] = []
+    monkeypatch.setattr(trtllm_ar, "cudart", SimpleNamespace(cudaFree=lambda p: freed.append(p.value)))
+    handles = [[1, 2], [3, 4], [5, 6]]
+    block = trtllm_ar._ControlBlock(0xC0DE)
+    monkeypatch.setitem(trtllm_ar._symm_workspace_refs, id(handles), [object(), block])
+    comm.trtllm_destroy_ipc_workspace_for_all_reduce_fusion(handles)
+    comm.trtllm_destroy_ipc_workspace_for_all_reduce_fusion(handles)  # second call: nothing left to free
+    block.free()  # direct second free is also a no-op
+    assert freed == [0xC0DE] and block.freed
 
 
 def test_wrapper_rejects_misaligned_slot_stride():

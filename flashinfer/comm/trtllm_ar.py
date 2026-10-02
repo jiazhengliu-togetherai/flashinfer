@@ -16,6 +16,7 @@ limitations under the License.
 
 import functools
 import logging
+import sys
 from ctypes import c_void_p, cast, create_string_buffer
 from types import SimpleNamespace
 from typing import List, Optional, Tuple, Union
@@ -450,6 +451,31 @@ LamportTokenNumThreshold = 16
 _symm_workspace_refs: dict[int, list[object]] = {}
 
 
+class _ControlBlock:
+    """Owner of a workspace's 20-byte control block (atomic counter, flags, slot
+    stride, clear size), cudaMalloc'ed once per workspace. It lives in the
+    workspace's registry entry and is freed exactly once by the destroy function
+    (or at collection as a fallback); before this the block leaked on every
+    destroy/recreate cycle."""
+
+    def __init__(self, ptr: int) -> None:
+        self.ptr = ptr
+        self.freed = False
+
+    def free(self) -> None:
+        if not self.freed and self.ptr:
+            cudart.cudaFree(c_void_p(self.ptr))
+            self.freed = True
+
+    def __del__(self) -> None:
+        if sys.is_finalizing():
+            return
+        try:
+            self.free()
+        except Exception:  # the CUDA context may already be gone at interpreter exit
+            pass
+
+
 @deprecated(
     "trtllm_create_ipc_workspace_for_all_reduce and trtllm_custom_all_reduce are deprecated and will be removed in the next major bump, use allreduce.py instead."
 )
@@ -563,7 +589,10 @@ def trtllm_destroy_ipc_workspace_for_all_reduce(
         workspace: The ipc_handles list returned by the create function.
         group: Unused, kept for API compatibility.
     """
-    _symm_workspace_refs.pop(id(workspace), None)
+    refs = _symm_workspace_refs.pop(id(workspace), None)
+    for ref in refs or []:
+        if isinstance(ref, _ControlBlock):
+            ref.free()  # exactly once; a second destroy finds no registry entry
 
 
 BarrierFlagCount = 256
@@ -782,8 +811,9 @@ def trtllm_create_ipc_workspace_for_all_reduce_fusion(
         c_void_p(flag_ptr.value + 3 * 4), cast(lamport_comm_size_bytes, c_void_p), 4
     )
     logger.debug("set flag_ptr[3] = lamport_comm_size: %s", lamport_comm_size)
-    # add flag_ptr to workspace
+    # add flag_ptr to workspace; the registry entry owns the block and frees it on destroy
     workspace.append(flag_ptr.value)
+    symm_refs.append(_ControlBlock(flag_ptr.value))
 
     for i in range(len(workspace)):
         logger.debug("Rank %s workspace[%d] %s", tp_rank, i, hex(workspace[i]))
@@ -833,7 +863,10 @@ def trtllm_destroy_ipc_workspace_for_all_reduce_fusion(
         workspace: The ipc_handles list returned by the create function.
         group: Unused, kept for API compatibility.
     """
-    _symm_workspace_refs.pop(id(workspace), None)
+    refs = _symm_workspace_refs.pop(id(workspace), None)
+    for ref in refs or []:
+        if isinstance(ref, _ControlBlock):
+            ref.free()  # exactly once; a second destroy finds no registry entry
 
 
 # allReduce fused quant utils
