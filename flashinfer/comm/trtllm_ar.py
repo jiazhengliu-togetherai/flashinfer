@@ -1352,12 +1352,28 @@ def trtllm_allgather(
     reads peer pointers and flags from the workspace pointer table at run time, so a CUDA graph that records this
     call stays valid when the workspace is re-created at the same address with new peer pointers. Capacity:
     input.numel() * world_size * itemsize must fit lamport_comm_size (checked when metadata is given).
+    Requirements checked before launch (ValueError): dtype fp16/bf16/fp32; contiguous input and output; numel a
+    multiple of the 16-byte vector (8 fp16/bf16 or 4 fp32 elements); 16-byte aligned data pointers (a slice at an
+    odd storage offset is rejected). An empty input is a no-op. -0.0 inputs come out as +0.0 (Lamport sentinel).
     """
-    assert input.is_contiguous() and output.is_contiguous(), "trtllm_allgather needs contiguous tensors"
+    if input.dtype not in (torch.float16, torch.bfloat16, torch.float32):
+        raise ValueError(f"trtllm_allgather: unsupported dtype {input.dtype} (float16, bfloat16, float32)")
+    if not (input.is_contiguous() and output.is_contiguous()):
+        raise ValueError("trtllm_allgather: input and output must be contiguous")
     n = input.numel()
-    assert output.numel() == n * world_size and output.dtype == input.dtype, "output must be [world_size, *input.shape]"
+    if output.numel() != n * world_size or output.dtype != input.dtype:
+        raise ValueError("trtllm_allgather: output must be [world_size, *input.shape] with input's dtype")
+    if n == 0:
+        return  # nothing to exchange; the Lamport slot rotation is left untouched on every rank
+    vec = 16 // input.element_size()  # the kernel moves 16-byte vectors
+    if n % vec != 0:
+        raise ValueError(f"trtllm_allgather: input.numel() ({n}) must be a multiple of {vec} elements (16-byte vectors)")
+    if input.data_ptr() % 16 != 0 or output.data_ptr() % 16 != 0:
+        raise ValueError("trtllm_allgather: input and output must start at 16-byte aligned addresses (slice at a multiple of 16 bytes)")
+    need = n * world_size * input.element_size()
+    if need > MAX_COMM_SIZE:
+        raise ValueError(f"trtllm_allgather: {need} B exceeds MAX_COMM_SIZE {MAX_COMM_SIZE} B")
     if metadata is not None:
-        need = n * world_size * input.element_size()
         if need > metadata["lamport_comm_size"]:
             raise ValueError(f"trtllm_allgather: {need} B exceeds the workspace lamport_comm_size {metadata['lamport_comm_size']} B")
         if metadata["tp_size"] != world_size:
