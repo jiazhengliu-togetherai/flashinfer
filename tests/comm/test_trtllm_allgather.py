@@ -384,19 +384,32 @@ def s_workspace_replacement(world_size, rank, dtype, rounds: int = 3):
         assert ws.data_ptr() == table_ptr, "pointer table moved"
         dist.barrier()  # all ranks switched before anyone replays
         ncalls = 0
+
+        def check_controls(where: str) -> None:
+            # own control blocks are written by this rank's kernels only, so after the stream sync inside the
+            # replay/eager helpers they are deterministic: the retired one must not move, the new one must have
+            # advanced by exactly the calls issued so far. Checked after EVERY step: a graph that still used the
+            # retired control pointer leaves the new flag at 0 after the first 2-call replay, where the end-of-round
+            # total (7 calls -> flag 1) would have masked it through the mod-3 wrap.
+            old_now = _read_i32(old_ctrl, 5)
+            new_now = _read_i32(new_ctrl, 5)
+            assert old_now == old_flag_before, f"round {rnd} {where}: retired control block changed {old_flag_before} -> {old_now}"
+            assert new_now[2] == ncalls % 3 and new_now[0] == 0, (
+                f"round {rnd} {where}: new control block {new_now}, expected flag {ncalls % 3} after {ncalls} calls"
+            )
+
         for rep in range(2):
             _replay_checked(rank, world_size, graph, xs, outs, shapes, dtype, device, calls, f"round {rnd} rep {rep}")
             ncalls += len(shapes)
+            check_controls(f"after replay {rep}")  # first replay: 2 calls -> new flag must read 2
         gather_checked(rank, world_size, ws, meta_b, dtype, device, (5, HIDDEN_DIM), calls)  # eager on the new table
         ncalls += 1
+        check_controls("after eager")
         _replay_checked(rank, world_size, graph, xs, outs, shapes, dtype, device, calls, f"round {rnd} after eager")
         ncalls += len(shapes)
+        check_controls("after final replay")
         torch.cuda.synchronize()
-        dist.barrier()  # every rank's kernels for this round have finished before inspecting state
-        old_flag_after = _read_i32(old_ctrl, 5)
-        new_flag = _read_i32(new_ctrl, 5)
-        assert old_flag_after == old_flag_before, f"round {rnd}: retired control block changed {old_flag_before} -> {old_flag_after}"
-        assert new_flag[2] == ncalls % 3 and new_flag[0] == 0, f"round {rnd}: new control block {new_flag}, expected flag {ncalls % 3}"
+        dist.barrier()  # every rank's kernels for this round have finished before inspecting shared buffers
         for slot in range(3):
             head = _read_bytes(old_data + slot * stride, 256)
             assert head == b"\x55" * 256, f"round {rnd}: retired slot {slot} was written after retirement"
